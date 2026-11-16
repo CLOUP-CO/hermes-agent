@@ -113,6 +113,13 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
+
+# A block whose reason is just "wait until <time>" is not a human question: it parks in
+# ``scheduled`` instead of looping block -> triage -> specify -> respawn (hundreds of runs/day).
+_TIME_WAIT_RE = re.compile(
+    r"espera de tiempo|no re-?promover antes|esperar hasta|time[- ]wait|wait(?:ing)? until|do not re-?promote before",
+    re.IGNORECASE,
+)
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
@@ -3218,6 +3225,9 @@ def _route_block(
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
+    A time-wait reason (``_TIME_WAIT_RE``) parks in ``scheduled`` (not dispatchable,
+    no recurrence count), so it can never reach the loop breaker.
+
     ``dependency`` never enters the human ``blocked`` bucket: it waits in
     ``todo`` for ``recompute_ready``, so a cron never sees a dependency-wait
     as something to "unblock". Callers that pass ``dependency`` with no
@@ -3232,6 +3242,8 @@ def _route_block(
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
+    if reason and _TIME_WAIT_RE.search(reason):
+        return "scheduled", "scheduled", "block_kind    = ?", (kind,), {"reason": reason}
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
