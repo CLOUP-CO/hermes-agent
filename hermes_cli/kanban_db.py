@@ -26,7 +26,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -2040,8 +2040,9 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
 
 
 def _scheduled_until(reason: Optional[str]) -> Optional[int]:
-    """Epoch seconds of the ``SCHEDULED_UNTIL=<ISO8601>`` marker in *reason*
-    (naive timestamps are UTC), or ``None`` when absent or unreadable."""
+    """Epoch seconds of the ``SCHEDULED_UNTIL=<ISO8601>`` marker in *reason*, or
+    ``None`` when absent, unreadable or without a timezone (a naive instant is
+    ambiguous, so it never parks a task)."""
     match = _TIME_WAIT_RE.search(reason or "")
     if not match:
         return None
@@ -2050,18 +2051,24 @@ def _scheduled_until(reason: Optional[str]) -> Optional[int]:
     except ValueError:
         return None
     if when.tzinfo is None:
-        when = when.replace(tzinfo=timezone.utc)
+        return None
     return int(when.timestamp())
 
 
 def _due_scheduled_ids(conn: sqlite3.Connection, now: int) -> list[str]:
     """``scheduled`` tasks whose latest ``scheduled`` event carries a
-    ``SCHEDULED_UNTIL`` that has already passed."""
+    ``SCHEDULED_UNTIL`` that was in the future when parked and has now passed
+    (a marker already past at parking time never wakes: no respawn loop)."""
     due = []
     for row in conn.execute("SELECT id FROM tasks WHERE status = 'scheduled'").fetchall():
-        event = _latest_event(conn, row["id"], "scheduled")
+        event = conn.execute(
+            "SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = 'scheduled' "
+            "ORDER BY id DESC LIMIT 1", (row["id"],),
+        ).fetchone()
+        if event is None:
+            continue
         until = _scheduled_until(_json_dict(_row_get(event, "payload")).get("reason"))
-        if until is not None and until <= now:
+        if until is not None and int(event["created_at"]) < until <= now:
             due.append(row["id"])
     return due
 
@@ -3260,7 +3267,7 @@ def _route_block(
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
-    A reason with a readable ``SCHEDULED_UNTIL=<ISO8601>`` parks in ``scheduled``
+    A reason with a future, timezone-aware ``SCHEDULED_UNTIL=<ISO8601>`` parks in ``scheduled``
     (not dispatchable, no recurrence count, woken by :func:`recompute_ready`),
     whatever the kind, so it can never reach the loop breaker.
 
@@ -3278,7 +3285,8 @@ def _route_block(
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
-    if _scheduled_until(reason) is not None:
+    until = _scheduled_until(reason)
+    if until is not None and until > int(time.time()):
         return "scheduled", "scheduled", "block_kind    = ?", (kind,), {"reason": reason}
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"

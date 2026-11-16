@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -74,6 +76,8 @@ def test_time_wait_closes_run_as_scheduled_without_block_hook(
         ("needs_input", "esperar hasta que una persona apruebe"),
         ("capability", "Falta credencial; esperar hasta que la entreguen"),
         ("needs_input", "SCHEDULED_UNTIL=manana-temprano"),
+        ("needs_input", PAST),
+        ("needs_input", "SCHEDULED_UNTIL=2999-01-01T00:00:00 sin zona"),
     ],
 )
 def test_human_wait_or_unreadable_instant_stays_blocked(kanban_home: Path, kind: str, reason: str) -> None:
@@ -92,23 +96,42 @@ def test_scheduled_until_future_stays_parked_and_not_claimable(kanban_home: Path
         assert kb.claim_task(conn, tid, claimer="worker") is None
 
 
-def test_scheduled_until_past_wakes_to_ready(kanban_home: Path) -> None:
+def _soon() -> str:
+    when = datetime.fromtimestamp(time.time() + 60, tz=timezone.utc)
+    return f"SCHEDULED_UNTIL={when.isoformat()} medir"
+
+
+def _advance(monkeypatch: pytest.MonkeyPatch, seconds: int) -> None:
+    real = time.time
+    monkeypatch.setattr(kb.time, "time", lambda: real() + seconds)
+
+
+def test_scheduled_until_passed_wakes_to_ready(kanban_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     with kbc.connect_closing() as conn:
         tid = _new_running(conn)
-        assert kb.block_task(conn, tid, reason=PAST)
+        assert kb.block_task(conn, tid, reason=_soon())
         assert kb.get_task(conn, tid).status == "scheduled"
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, tid).status == "scheduled"
+        _advance(monkeypatch, 120)
         kb.recompute_ready(conn)
         assert kb.get_task(conn, tid).status == "ready"
 
 
-def test_kanban_schedule_with_past_marker_wakes_and_without_marker_stays(kanban_home: Path) -> None:
+def test_kanban_schedule_wakes_when_marker_passes_and_never_for_past_marker(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     with kbc.connect_closing() as conn:
         woken = _new_running(conn)
-        assert kb.schedule_task(conn, woken, reason=PAST)
+        assert kb.schedule_task(conn, woken, reason=_soon())
+        past = _new_running(conn)
+        assert kb.schedule_task(conn, past, reason=PAST)
         parked = _new_running(conn)
         assert kb.schedule_task(conn, parked, reason="esperando al proveedor")
+        _advance(monkeypatch, 120)
         kb.recompute_ready(conn)
         assert kb.get_task(conn, woken).status == "ready"
+        assert kb.get_task(conn, past).status == "scheduled"
         assert kb.get_task(conn, parked).status == "scheduled"
 
 
