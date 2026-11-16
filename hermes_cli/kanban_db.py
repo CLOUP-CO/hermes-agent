@@ -26,6 +26,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -114,12 +115,10 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
 
-# A block whose reason is just "wait until <time>" is not a human question: it parks in
-# ``scheduled`` instead of looping block -> triage -> specify -> respawn (hundreds of runs/day).
-_TIME_WAIT_RE = re.compile(
-    r"espera de tiempo|no re-?promover antes|esperar hasta|time[- ]wait|wait(?:ing)? until|do not re-?promote before",
-    re.IGNORECASE,
-)
+# A block whose reason carries ``SCHEDULED_UNTIL=<ISO8601>`` is a wait for time, not a question
+# for a person: it parks in ``scheduled`` instead of looping block -> triage -> specify -> respawn,
+# and ``recompute_ready`` wakes it once the instant has passed.
+_TIME_WAIT_RE = re.compile(r"SCHEDULED_UNTIL=(\S+)")
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
@@ -2040,6 +2039,33 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     return "ready"
 
 
+def _scheduled_until(reason: Optional[str]) -> Optional[int]:
+    """Epoch seconds of the ``SCHEDULED_UNTIL=<ISO8601>`` marker in *reason*
+    (naive timestamps are UTC), or ``None`` when absent or unreadable."""
+    match = _TIME_WAIT_RE.search(reason or "")
+    if not match:
+        return None
+    try:
+        when = datetime.fromisoformat(match.group(1).rstrip(".,;)"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return int(when.timestamp())
+
+
+def _due_scheduled_ids(conn: sqlite3.Connection, now: int) -> list[str]:
+    """``scheduled`` tasks whose latest ``scheduled`` event carries a
+    ``SCHEDULED_UNTIL`` that has already passed."""
+    due = []
+    for row in conn.execute("SELECT id FROM tasks WHERE status = 'scheduled'").fetchall():
+        event = _latest_event(conn, row["id"], "scheduled")
+        until = _scheduled_until(_json_dict(_row_get(event, "payload")).get("reason"))
+        if until is not None and until <= now:
+            due.append(row["id"])
+    return due
+
+
 def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) -> int:
     """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
     returns the count. Opens its own IMMEDIATE txn — call OUTSIDE any write txn.
@@ -2048,6 +2074,9 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
     ``consecutive_failures`` reached the limit (else the breaker could never
     trip). Limit order matches ``_record_task_failure``: ``max_retries`` >
     ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``.
+
+    ``scheduled`` tasks whose ``SCHEDULED_UNTIL`` has passed are woken through
+    :func:`unblock_task` (parents re-gated) and counted.
 
     1. The most recent block event was a worker-initiated ``kanban_block`` — those stay blocked until an
     explicit ``kanban_unblock`` (#28712).
@@ -2099,6 +2128,9 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
                     {"status": resume_status} if resume_status != "ready" else None,
                 )
                 promoted += 1
+    for task_id in _due_scheduled_ids(conn, int(time.time())):
+        if unblock_task(conn, task_id):
+            promoted += 1
     return promoted
 
 
@@ -3211,11 +3243,14 @@ def block_task(
         if conn.execute(sql, params).rowcount != 1:
             return False
         run_id = _end_or_synthesize_run(
-            conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
+            conn, task_id, outcome=new_status if new_status == "scheduled" else "blocked",
+            status=new_status if new_status == "scheduled" else "blocked",
+            summary=reason, synthesize=bool(reason),
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
-    _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
+    if new_status != "scheduled":
+        _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
 
 
@@ -3225,8 +3260,9 @@ def _route_block(
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
-    A time-wait reason (``_TIME_WAIT_RE``) parks in ``scheduled`` (not dispatchable,
-    no recurrence count), so it can never reach the loop breaker.
+    A reason with a readable ``SCHEDULED_UNTIL=<ISO8601>`` parks in ``scheduled``
+    (not dispatchable, no recurrence count, woken by :func:`recompute_ready`),
+    whatever the kind, so it can never reach the loop breaker.
 
     ``dependency`` never enters the human ``blocked`` bucket: it waits in
     ``todo`` for ``recompute_ready``, so a cron never sees a dependency-wait
@@ -3242,7 +3278,7 @@ def _route_block(
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
-    if reason and _TIME_WAIT_RE.search(reason):
+    if _scheduled_until(reason) is not None:
         return "scheduled", "scheduled", "block_kind    = ?", (kind,), {"reason": reason}
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
