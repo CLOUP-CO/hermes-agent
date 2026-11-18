@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -97,7 +97,7 @@ def test_scheduled_until_future_stays_parked_and_not_claimable(kanban_home: Path
 
 
 def _soon() -> str:
-    when = datetime.fromtimestamp(time.time() + 60, tz=timezone.utc)
+    when = datetime.fromtimestamp(time.time() + 60, tz=UTC)
     return f"SCHEDULED_UNTIL={when.isoformat()} medir"
 
 
