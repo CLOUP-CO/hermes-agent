@@ -42,13 +42,13 @@ jobs:
     # 3x the price because files contend for the shared machine. Separate machines
     # scale linearly. run_tests_parallel.py partitions from the checkout alone, so
     # both slices agree on the split without a planning job.
-    name: Run tests (${{ matrix.slice }}/2)
-    runs-on: blacksmith-32vcpu-ubuntu-2404
-    timeout-minutes: 30
+    name: Run tests (${{ matrix.slice }}/6)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        slice: [1, 2]
+        slice: [1, 2, 3, 4, 5, 6]
     steps:
       - name: Checkout code
         uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
@@ -112,8 +112,9 @@ jobs:
         run: |
           scripts/run_tests.sh
         env:
-          HERMES_TEST_SLICE: ${{ matrix.slice }}/2
-          HERMES_TEST_WORKERS: 32
+          HERMES_TEST_SLICE: ${{ matrix.slice }}/6
+          # Six slices x six workers keep each file inside its deadline.
+          HERMES_TEST_WORKERS: 6
           HERMES_TEST_FILE_TIMEOUT: 600
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
@@ -142,7 +143,7 @@ jobs:
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; a 4-vCPU runner serialises them into timeouts.
     if: inputs.e2e
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -270,7 +271,7 @@ jobs:
     # carries the whole tree's wall time against the 60-minute timeout.
     # Skipping this job skips every e2e-upgrade shard with it.
     if: inputs.e2e_upgrade
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
@@ -314,7 +315,7 @@ jobs:
     # runs ~5-15 min. Sharded by suite directory (see e2e-upgrade-plan).
     name: e2e-upgrade (${{ matrix.shard }})
     needs: e2e-upgrade-plan
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -328,6 +329,11 @@ jobs:
           # N-1 = `git describe --tags --abbrev=0 HEAD~1`.
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Fetch release tags from upstream
+        # Release tags live upstream; e2e-upgrade resolves N-1 with
+        # `git describe --tags --match 'v20[0-9][0-9].*' HEAD~1`.
+        run: git fetch --no-recurse-submodules --force https://github.com/NousResearch/hermes-agent.git 'refs/tags/v20*:refs/tags/v20*'
 
       - name: Set up Node
         # `hermes update` builds the web UI / TUI workspaces.
